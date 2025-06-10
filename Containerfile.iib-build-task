@@ -1,4 +1,4 @@
-FROM registry.redhat.io/ubi9/ubi-minimal:9.6-1747218906
+FROM registry.access.redhat.com/ubi9/ubi-minimal:9.6-1747218906
 
 WORKDIR /opt/app-root/src
 
