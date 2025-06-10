@@ -1,0 +1,67 @@
+---
+name: Docker Image CI (Buildah)
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'Containerfile.iib-build-task'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'Containerfile.iib-build-task'
+jobs:
+  build-pr:
+    name: Build Docker Image (PR - Buildah)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build Docker image with Buildah
+        uses: redhat-actions/buildah-build@v2
+        with:
+          image: ${{ github.event.repository.name }}
+          tags: pr-${{ github.event.pull_request.head.sha }}
+          containerfiles: Containerfile.iib-build-task
+
+  build-and-push:
+    name: Build and Push Docker Image (Buildah)
+    runs-on: ubuntu-latest
+    needs: build-pr
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: quay.io/exd-guild-hello-operator/iib-build-task
+          tags: |
+            type=sha,format=long # Tag with full Git SHA
+            type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }} # Tag 'latest' only on pushes to the default branch
+
+      - name: Build iib-build-task
+        id: build-iib-build-task
+        uses: redhat-actions/buildah-build@v2
+        with:
+          image: iib-build-task
+          tags: ${{ steps.meta.outputs.tags }}
+          containerfiles: Containerfile.iib-build-task
+
+      - name: Push iib-build-task to quay.io
+        id: push-iib-build-task
+        uses: redhat-actions/push-to-registry@v2.7.1
+        with:
+          image: ${{ steps.build-iib-build-task.outputs.image }}
+          tags: ${{ steps.build-iib-build-task.outputs.tags }}
+          registry: quay.io/exd-guild-hello-operator
+          username: ${{ secrets.QUAY_USERNAME }}
+          password: ${{ secrets.QUAY_TOKEN }}
