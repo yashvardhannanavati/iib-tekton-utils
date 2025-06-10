@@ -4,6 +4,7 @@ WORKDIR /opt/app-root/src
 
 ADD https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm epel-release-latest-9.noarch.rpm
 
+# We need multiple OPM versions because IIB uses different upstream versions for different OCP versions
 ARG OPM_VERSION_1_26_4=v1.26.4
 ARG OPM_VERSION_1_40_0=v1.40.0
 ARG OPM_VERSION_1_44_0=v1.44.0
