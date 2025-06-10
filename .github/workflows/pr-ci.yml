@@ -1,0 +1,24 @@
+---
+name: Docker Image CI for PRs (Buildah)
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'Containerfile.iib-build-task'
+jobs:
+  build-pr:
+    name: Build Docker Image (PR - Buildah)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build Docker image with Buildah
+        uses: redhat-actions/buildah-build@v2
+        with:
+          image: ${{ github.event.repository.name }}
+          tags: pr-${{ github.event.pull_request.head.sha }}
+          containerfiles: Containerfile.iib-build-task
