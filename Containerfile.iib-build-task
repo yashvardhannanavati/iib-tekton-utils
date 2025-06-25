@@ -1,8 +1,6 @@
-FROM registry.access.redhat.com/ubi9/ubi-minimal:9.6-1747218906
+FROM quay.io/konflux-ci/buildah-task:latest@sha256:4d8273444b0f2781264c232e12e88449bbf078c99e3da2a7f6dcaaf27bc53712
 
 WORKDIR /opt/app-root/src
-
-ADD https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm epel-release-latest-9.noarch.rpm
 
 # We need multiple OPM versions because IIB uses different upstream versions for different OCP versions
 ARG OPM_VERSION_1_26_4=v1.26.4
@@ -11,14 +9,26 @@ ARG OPM_VERSION_1_44_0=v1.44.0
 ARG OPM_VERSION_1_48_0=v1.48.0
 ARG ORAS_VERSION="1.2.3"
 
-RUN rpm -Uvh epel-release-latest-9.noarch.rpm && \
-    microdnf -y --setopt=tsflags=nodocs --setopt=install_weak_deps=0 install \
+RUN microdnf -y --setopt=tsflags=nodocs --setopt=install_weak_deps=0 install \
     findutils \
     gzip \
     jq \
-    tar && \
+    tar \
+    python3 \
+    python3-pip \
+    skopeo \
+    git \
+    python3-file-magic && \
     microdnf clean all
 
+# Install Python dependencies
+RUN pip3 install --no-cache-dir \
+    tenacity \
+    GitPython \
+    kubernetes \
+    ruamel.yaml
+
+# Install OPM versions
 RUN curl -s -L https://github.com/operator-framework/operator-registry/releases/download/"${OPM_VERSION_1_26_4}"/linux-amd64-opm > /usr/bin/opm-"${OPM_VERSION_1_26_4}" && \
     curl -s -L https://github.com/operator-framework/operator-registry/releases/download/"${OPM_VERSION_1_40_0}"/linux-amd64-opm > /usr/bin/opm-"${OPM_VERSION_1_40_0}" && \
     curl -s -L https://github.com/operator-framework/operator-registry/releases/download/"${OPM_VERSION_1_44_0}"/linux-amd64-opm > /usr/bin/opm-"${OPM_VERSION_1_44_0}" && \
