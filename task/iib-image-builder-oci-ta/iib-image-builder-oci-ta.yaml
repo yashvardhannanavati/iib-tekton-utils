@@ -1,0 +1,188 @@
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: iib-image-builder-oci-ta
+  annotations:
+    tekton.dev/pipelines.minVersion: 0.12.1
+    tekton.dev/tags: image-build, konflux
+  labels:
+    app.kubernetes.io/version: "0.1"
+    build.appstudio.redhat.com/build_type: docker
+spec:
+  description: |-
+    This task builds source code into multi-architecture index images using Python orchestration
+    with buildah.
+  params:
+    - name: COMMIT_SHA
+      description: The image is built from this commit.
+      type: string
+      default: ""
+    - name: CONTEXT
+      description: Path to the directory to use as context.
+      type: string
+      default: .
+    - name: DOCKERFILE
+      description: Path to the Dockerfile to build.
+      type: string
+      default: ./Dockerfile
+    - name: IMAGE
+      description: Reference of the image buildah will produce.
+      type: string
+    - name: IMAGE_EXPIRES_AFTER
+      description: Delete image tag after specified time. Empty means to keep the image tag.
+      type: string
+      default: ""
+    - name: LABELS
+      description: Additional key=value labels that should be applied to the image
+      type: array
+      default: []
+    - name: SOURCE_ARTIFACT
+      description: The Trusted Artifact URI pointing to the artifact with the application source code.
+      type: string
+    - name: STORAGE_DRIVER
+      description: Storage driver to configure for buildah
+      type: string
+      default: overlay
+    - name: PLATFORMS
+      description: Comma-separated list of platforms to build for (e.g., linux/amd64,linux/arm64,linux/ppc64le,linux/s390x)
+      type: string
+      default: "linux/amd64,linux/arm64,linux/ppc64le,linux/s390x"
+    - name: OPM_VERSION
+      description: OPM version to use for cache generation
+      type: string
+      default: "v1.48.0"
+    - name: RETRY_ATTEMPTS
+      description: Number of retry attempts for build operations
+      type: string
+      default: "3"
+    - name: RETRY_DELAY
+      description: Delay between retry attempts in seconds
+      type: string
+      default: "5"
+    - name: caTrustConfigMapKey
+      description: The name of the key in the ConfigMap that contains the CA bundle data.
+      type: string
+      default: ca-bundle.crt
+    - name: caTrustConfigMapName
+      description: The name of the ConfigMap to read CA bundle data from.
+      type: string
+      default: trusted-ca
+  results:
+    - name: IMAGE_DIGEST
+      description: Digest of the multi-arch image manifest
+    - name: IMAGE_REF
+      description: Image reference of the built multi-arch image
+    - name: IMAGE_URL
+      description: Image repository and tag where the built image was pushed
+    - name: BUILD_RESULTS
+      description: JSON file containing detailed build results
+  volumes:
+    - name: shared
+      emptyDir: {}
+    - name: trusted-ca
+      configMap:
+        items:
+          - key: $(params.caTrustConfigMapKey)
+            path: ca-bundle.crt
+        name: $(params.caTrustConfigMapName)
+        optional: true
+    - name: varlibcontainers
+      emptyDir: {}
+    - name: workdir
+      emptyDir: {}
+    - name: cache
+      emptyDir: {}
+  stepTemplate:
+    computeResources:
+      limits:
+        memory: 16Gi
+      requests:
+        cpu: "4"
+        memory: 4Gi
+    env:
+      - name: CONTEXT
+        value: $(params.CONTEXT)
+      - name: IMAGE
+        value: $(params.IMAGE)
+      - name: IMAGE_EXPIRES_AFTER
+        value: $(params.IMAGE_EXPIRES_AFTER)
+      - name: STORAGE_DRIVER
+        value: $(params.STORAGE_DRIVER)
+      - name: PLATFORMS
+        value: $(params.PLATFORMS)
+      - name: OPM_VERSION
+        value: $(params.OPM_VERSION)
+      - name: RETRY_ATTEMPTS
+        value: $(params.RETRY_ATTEMPTS)
+      - name: RETRY_DELAY
+        value: $(params.RETRY_DELAY)
+      - name: CACHE_DIR
+        value: /var/workdir/cache
+    volumeMounts:
+      - mountPath: /shared
+        name: shared
+      - mountPath: /var/workdir
+        name: workdir
+      - mountPath: /var/workdir/cache
+        name: cache
+  steps:
+    - name: use-trusted-artifact
+      image: quay.io/konflux-ci/build-trusted-artifacts:latest@sha256:edd8e3affc389320b15b9de8a5aedbf7b0463211b77c981563a2cfa20076b0c0
+      args:
+        - use
+        - $(params.SOURCE_ARTIFACT)=/var/workdir/source
+      volumeMounts:
+        - mountPath: /etc/pki/tls/certs/ca-custom-bundle.crt
+          name: trusted-ca
+          readOnly: true
+          subPath: ca-bundle.crt
+    - name: prepare-build-config
+      image: quay.io/exd-guild-hello-operator/iib-build-task:latest
+      workingDir: /var/workdir
+      script: |
+        #!/bin/bash
+        set -euo pipefail
+
+        echo "[$(date --utc -Ins)] Preparing build configuration"
+
+        # Prepare labels string
+        LABELS_STR=""
+        if [ ${#LABELS[@]} -gt 0 ]; then
+          LABELS_STR=$(IFS=','; echo "${LABELS[*]}")
+        fi
+
+        # Set environment variables for Python script
+        export LABELS="$LABELS_STR"
+
+        echo "[$(date --utc -Ins)] Build configuration prepared"
+        echo "Labels: $LABELS_STR"
+        echo "OPM Version: $OPM_VERSION"
+        echo "Platforms: $PLATFORMS"
+      volumeMounts:
+        - mountPath: /var/lib/containers
+          name: varlibcontainers
+        - mountPath: /mnt/trusted-ca
+          name: trusted-ca
+          readOnly: true
+    - name: build-multi-arch
+      image: quay.io/exd-guild-hello-operator/iib-build-task:latest
+      workingDir: /var/workdir
+      script: |
+        #!/bin/bash
+        set -euo pipefail
+
+        echo "[$(date --utc -Ins)] Starting multi-architecture build with Python orchestration"
+
+        echo "[$(date --utc -Ins)] Multi-architecture build completed"
+      volumeMounts:
+        - mountPath: /var/lib/containers
+          name: varlibcontainers
+        - mountPath: /mnt/trusted-ca
+          name: trusted-ca
+          readOnly: true
+      securityContext:
+        capabilities:
+          add:
+            - SETFCAP
+        runAsUser: 0 
