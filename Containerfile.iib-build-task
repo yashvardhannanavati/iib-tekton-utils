@@ -37,4 +37,8 @@ RUN curl -s -L https://github.com/operator-framework/operator-registry/releases/
     tar -xzf oras.tar.gz && rm oras.tar.gz && ls -la  && mv oras /usr/bin/oras && chmod +x /usr/bin/oras && \
     chmod +x /usr/bin/opm-*
 
+# Copy the multi-arch builder script
+COPY task/iib-image-builder-oci-ta/multi-arch-builder.py /usr/local/bin/multi-arch-builder.py
+RUN chmod +x /usr/local/bin/multi-arch-builder.py
+
 ENTRYPOINT ["/usr/bin/bash"]

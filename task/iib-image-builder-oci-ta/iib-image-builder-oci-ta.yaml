@@ -45,9 +45,9 @@ spec:
       type: string
       default: overlay
     - name: PLATFORMS
-      description: Comma-separated list of platforms to build for (e.g., linux/amd64,linux/arm64,linux/ppc64le,linux/s390x)
+      description: Comma-separated list of platforms to build for (e.g., amd64,arm64,ppc64le,s390x)
       type: string
-      default: "linux/amd64,linux/arm64,linux/ppc64le,linux/s390x"
+      default: "amd64,arm64,ppc64le,s390x"
     - name: OPM_VERSION
       description: OPM version to use for cache generation
       type: string
@@ -75,8 +75,6 @@ spec:
       description: Image reference of the built multi-arch image
     - name: IMAGE_URL
       description: Image repository and tag where the built image was pushed
-    - name: BUILD_RESULTS
-      description: JSON file containing detailed build results
   volumes:
     - name: shared
       emptyDir: {}
@@ -174,6 +172,32 @@ spec:
 
         echo "[$(date --utc -Ins)] Starting multi-architecture build with Python orchestration"
 
+        # Run the Python build script
+        python3 -u /usr/local/bin/multi-arch-builder.py \
+          --ca-bundle /mnt/trusted-ca/ca-bundle.crt \
+          --output /var/workdir/build-results.json
+
+        # Extract results for Tekton
+        if [ -f "/var/workdir/build-results.json" ]; then
+          # Extract digest
+          jq -r '.digest' /var/workdir/build-results.json > $(results.IMAGE_DIGEST.path)
+
+          # Extract image URL
+          jq -r '.image_name' /var/workdir/build-results.json > $(results.IMAGE_URL.path)
+
+          # Create image reference
+          IMAGE_NAME=$(jq -r '.image_name' /var/workdir/build-results.json)
+          DIGEST=$(jq -r '.digest' /var/workdir/build-results.json)
+          echo "${IMAGE_NAME}@${DIGEST}" > $(results.IMAGE_REF.path)
+
+          # Log build summary
+          echo "=== Build Summary ==="
+          echo "Image: $IMAGE_NAME"
+          echo "Digest: $DIGEST"
+          echo "Platforms: $(jq -r '.platforms | join(", ")' /var/workdir/build-results.json)"
+          echo "OPM Version: $(jq -r '.opm_version' /var/workdir/build-results.json)"
+        fi
+
         echo "[$(date --utc -Ins)] Multi-architecture build completed"
       volumeMounts:
         - mountPath: /var/lib/containers
@@ -185,4 +209,4 @@ spec:
         capabilities:
           add:
             - SETFCAP
-        runAsUser: 0 
+        runAsUser: 0
