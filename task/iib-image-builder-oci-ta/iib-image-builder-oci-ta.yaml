@@ -29,14 +29,10 @@ spec:
     - name: IMAGE
       description: Reference of the image buildah will produce.
       type: string
-    - name: IMAGE_EXPIRES_AFTER
-      description: Delete image tag after specified time. Empty means to keep the image tag.
-      type: string
-      default: ""
     - name: LABELS
       description: Additional key=value labels that should be applied to the image
-      type: array
-      default: []
+      type: string
+      default: ""
     - name: SOURCE_ARTIFACT
       description: The Trusted Artifact URI pointing to the artifact with the application source code.
       type: string
@@ -51,15 +47,7 @@ spec:
     - name: OPM_VERSION
       description: OPM version to use for cache generation
       type: string
-      default: "v1.48.0"
-    - name: RETRY_ATTEMPTS
-      description: Number of retry attempts for build operations
-      type: string
-      default: "3"
-    - name: RETRY_DELAY
-      description: Delay between retry attempts in seconds
-      type: string
-      default: "5"
+      default: "v1.40.0"
     - name: caTrustConfigMapKey
       description: The name of the key in the ConfigMap that contains the CA bundle data.
       type: string
@@ -99,22 +87,22 @@ spec:
         cpu: "4"
         memory: 4Gi
     env:
+      - name: COMMIT_SHA
+        value: $(params.COMMIT_SHA)
       - name: CONTEXT
         value: $(params.CONTEXT)
+      - name: DOCKERFILE
+        value: $(params.DOCKERFILE)
       - name: IMAGE
         value: $(params.IMAGE)
-      - name: IMAGE_EXPIRES_AFTER
-        value: $(params.IMAGE_EXPIRES_AFTER)
+      - name: LABELS
+        value: $(params.LABELS)
       - name: STORAGE_DRIVER
         value: $(params.STORAGE_DRIVER)
       - name: PLATFORMS
         value: $(params.PLATFORMS)
       - name: OPM_VERSION
         value: $(params.OPM_VERSION)
-      - name: RETRY_ATTEMPTS
-        value: $(params.RETRY_ATTEMPTS)
-      - name: RETRY_DELAY
-        value: $(params.RETRY_DELAY)
       - name: CACHE_DIR
         value: /var/workdir/cache
     volumeMounts:
@@ -135,40 +123,16 @@ spec:
           name: trusted-ca
           readOnly: true
           subPath: ca-bundle.crt
-    - name: prepare-build-config
-      image: quay.io/exd-guild-hello-operator/iib-build-task:latest
-      workingDir: /var/workdir
-      script: |
-        #!/bin/bash
-        set -euo pipefail
-
-        echo "[$(date --utc -Ins)] Preparing build configuration"
-
-        # Prepare labels string
-        LABELS_STR=""
-        if [ ${#LABELS[@]} -gt 0 ]; then
-          LABELS_STR=$(IFS=','; echo "${LABELS[*]}")
-        fi
-
-        # Set environment variables for Python script
-        export LABELS="$LABELS_STR"
-
-        echo "[$(date --utc -Ins)] Build configuration prepared"
-        echo "Labels: $LABELS_STR"
-        echo "OPM Version: $OPM_VERSION"
-        echo "Platforms: $PLATFORMS"
-      volumeMounts:
-        - mountPath: /var/lib/containers
-          name: varlibcontainers
-        - mountPath: /mnt/trusted-ca
-          name: trusted-ca
-          readOnly: true
     - name: build-multi-arch
       image: quay.io/exd-guild-hello-operator/iib-build-task:latest
       workingDir: /var/workdir
       script: |
         #!/bin/bash
         set -euo pipefail
+
+        echo "Labels: $LABELS"
+        echo "OPM Version: $OPM_VERSION"
+        echo "Platforms: $PLATFORMS"
 
         echo "[$(date --utc -Ins)] Starting multi-architecture build with Python orchestration"
 

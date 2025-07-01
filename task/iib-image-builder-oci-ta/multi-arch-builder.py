@@ -12,7 +12,6 @@ import re
 import shutil
 import subprocess
 import sys
-import time
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Set
 from dataclasses import dataclass, field
@@ -27,14 +26,16 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class IIBError(Exception):
+class IIBBaseException(Exception):
+    """The base class for all IIB exceptions."""
+
+
+class IIBError(IIBBaseException):
     """Custom exception for IIB operations."""
-    pass
 
 
-class ExternalServiceError(IIBError):
+class ExternalServiceError(IIBBaseException):
     """Exception for external service errors."""
-    pass
 
 
 def _regex_reverse_search(
@@ -129,10 +130,8 @@ class BuildConfig:
     platforms: List[str]
     labels: List[str]
     cache_dir: str
-    commit_sha: str = ""
-    opm_version: str = "v1.40.0"  # Default OPM version
-    retry_attempts: int = 3
-    retry_delay: int = 5
+    commit_sha: str
+    opm_version: str
     # Architecture mapping for platform names to expected architecture values
     arch_map: Dict[str, str] = field(default_factory=lambda: {
         'amd64': 'amd64',
@@ -172,13 +171,29 @@ def generate_cache_locally(
     ]
 
     logger.info('Generating cache for the file-based catalog')
+
+    # Clean up existing cache directory
     if os.path.exists(local_cache_path):
-        shutil.rmtree(local_cache_path)
+        # Remove contents but keep the directory structure because mount points cannot be removed
+        for item in os.listdir(local_cache_path):
+            item_path = os.path.join(local_cache_path, item)
+            if os.path.isfile(item_path):
+                os.remove(item_path)
+            elif os.path.isdir(item_path):
+                shutil.rmtree(item_path)
+
+    # Run the opm command
     run_cmd(cmd, {'cwd': base_dir}, exc_msg='Failed to generate cache for file-based catalog')
 
-    # Check if the opm command generated cache successfully
-    if not os.path.isdir(local_cache_path):
-        error_msg = f"Cannot find generated cache at {local_cache_path}"
+    try:
+        cache_contents = os.listdir(local_cache_path)
+        if not cache_contents:
+            error_msg = f"Cache directory is empty at {local_cache_path}"
+            logger.error(error_msg)
+            raise IIBError(error_msg)
+        logger.info(f"✓ Cache generated successfully with {len(cache_contents)} items")
+    except OSError as e:
+        error_msg = f"Cannot access cache directory at {local_cache_path}: {e}"
         logger.error(error_msg)
         raise IIBError(error_msg)
 
@@ -190,7 +205,12 @@ class MultiArchBuilder:
         self.config = config
         
     def validate_dockerfile(self) -> bool:
-        """Validate that Dockerfile exists."""
+        """
+        Validate that Dockerfile exists.
+
+        :return: True if Dockerfile exists, False otherwise
+        :rtype: bool
+        """
         if not Path(self.config.dockerfile_path).exists():
             logger.error(f"✗ Dockerfile not found: {self.config.dockerfile_path}")
             return False
@@ -198,7 +218,12 @@ class MultiArchBuilder:
         return True
 
     def _update_ca_trust(self, ca_bundle_path: str) -> None:
-        """Update CA trust certificates."""
+        """
+        Update CA trust certificates.
+
+        :param str ca_bundle_path: path to the CA bundle file
+        :raises IIBError: if updating CA trust fails
+        """
         if not Path(ca_bundle_path).exists():
             logger.warning(f"CA bundle not found at {ca_bundle_path}")
             return
@@ -217,7 +242,11 @@ class MultiArchBuilder:
             raise
 
     def _prepare_system(self) -> None:
-        """Prepare the system for buildah operations."""
+        """
+        Prepare the system for buildah operations.
+
+        :raises IIBError: if system preparation fails
+        """
         logger.info("Preparing system for buildah operations")
         
         try:
@@ -226,7 +255,7 @@ class MultiArchBuilder:
             
             # Configure short-name-mode
             run_cmd([
-                'sed', '-i', 's/^\s*short-name-mode\s*=\s*.*/short-name-mode = "disabled"/',
+                'sed', '-i', r's/^\s*short-name-mode\s*=\s*.*/short-name-mode = "disabled"/',
                 '/etc/containers/registries.conf'
             ])
             
@@ -282,7 +311,7 @@ class MultiArchBuilder:
         
         # Add labels
         for label in self.config.labels:
-            cmd.extend(['--label', label])
+            cmd.extend(['--label', label.strip()])
         
 
         # Add context
@@ -301,44 +330,37 @@ class MultiArchBuilder:
         
         :param str image_name: the image name to verify
         :param str expected_arch: the expected architecture
-        :raises ExternalServiceError: if architecture verification fails
         """
-        try:
-            # Get image architecture using skopeo inspect
-            inspect_cmd = ['skopeo', 'inspect', '--no-tags', f'containers-storage:{image_name}']
-            result = run_cmd(inspect_cmd, {'timeout': 60}, f"inspect {image_name} failed")
-            image_data = json.loads(result)
-            
-            # Check architecture in image config
-            arch = image_data.get('Architecture')
-            
-            if not arch:
-                logger.warning(
-                    'The "Architecture" was not found in image metadata. '
-                    'Skipping the check that confirms if the architecture was set correctly.'
-                )
-                return
-            
-            # Map of platform names to expected architecture values
-            # TODO: move to config
-            arch_map = self.config.arch_map
-            
-            expected_arch_value = arch_map.get(expected_arch, expected_arch)
-            
-            if arch != expected_arch_value:
-                logger.warning("Wrong arch created for %s", image_name)
-                raise ExternalServiceError(
-                    f'Wrong arch created, for image {image_name} '
-                    f'expected arch {expected_arch_value}, found {arch}'
-                )
-            
-            logger.info(f"✓ Architecture verification passed for {image_name}: {arch}")
-            
-        except Exception as e:
-            if isinstance(e, ExternalServiceError):
-                raise
-            logger.warning(f"Could not verify architecture for {image_name}: {e}")
-            # Don't fail the build if verification fails, just log a warning
+
+        # Get image architecture using skopeo inspect
+        inspect_cmd = ['skopeo', 'inspect', '--no-tags', f'containers-storage:{image_name}']
+        result = run_cmd(inspect_cmd, {'timeout': 60}, f"inspect {image_name} failed")
+        image_data = json.loads(result)
+
+        # Check architecture in image config
+        arch = image_data.get('Architecture')
+
+        if not arch:
+            logger.warning(
+                'The "Architecture" was not found in image metadata. '
+                'Skipping the check that confirms if the architecture was set correctly.'
+            )
+            return
+
+        # Map of platform names to expected architecture values
+        # TODO: move to config
+        arch_map = self.config.arch_map
+
+        expected_arch_value = arch_map.get(expected_arch, expected_arch)
+
+        if arch != expected_arch_value:
+            logger.warning("Wrong arch created for %s", image_name)
+            raise ExternalServiceError(
+                f'Wrong arch created, for image {image_name} '
+                f'expected arch {expected_arch_value}, found {arch}'
+            )
+
+        logger.info(f"✓ Architecture verification passed for {image_name}: {arch}")
 
     @retry(
         before_sleep=before_sleep_log(logger, logging.WARNING),
@@ -349,16 +371,12 @@ class MultiArchBuilder:
     )
     def _create_and_push_manifest_list(
         self,
-        arches: Set[str],
         platform_images: List[str],
     ) -> None:
         """
         Create and push the manifest list to the configured registry.
 
-        :param set arches: a set of arches to create the manifest list for
         :param list platform_images: list of platform-specific image names
-        :return: the pull specification of the manifest list
-        :rtype: str
         :raises IIBError: if creating or pushing the manifest list fails
         """
         buildah_manifest_cmd = ['buildah', 'manifest']
@@ -414,7 +432,15 @@ class MultiArchBuilder:
             )
     
     def build_all(self, ca_bundle_path: Optional[str] = None) -> Dict[str, Any]:
-        """Build multi-arch image and return results."""
+        """
+        Build multi-arch image and return results.
+
+        :param Optional[str] ca_bundle_path: path to CA bundle file for trust updates
+        :return: dictionary containing build results including image name, digest, platforms, etc.
+        :rtype: Dict[str, Any]
+        :raises IIBError: if the build process fails
+        :raises RuntimeError: if Dockerfile validation fails
+        """
         logger.info("Starting multi-architecture build")
         
         # Validate Dockerfile exists
@@ -430,7 +456,7 @@ class MultiArchBuilder:
         
         # Generate cache using OPM
         logger.info("Generating cache using OPM")
-        catalog_dir = Path(self.config.context_path) / "catalog"
+        catalog_dir = Path(self.config.context_path) / "configs"
         if not catalog_dir.exists():
             raise IIBError(f"Catalog directory not found at {catalog_dir}")
         
@@ -441,6 +467,18 @@ class MultiArchBuilder:
             local_cache_path=self.config.cache_dir
         )
         
+        # Copy cache into build context so Dockerfile can access it
+        logger.info("Copying cache into build context")
+        context_cache_dir = Path(self.config.context_path) / "cache"
+        try:
+            if context_cache_dir.exists():
+                shutil.rmtree(context_cache_dir)
+            shutil.copytree(self.config.cache_dir, context_cache_dir)
+            logger.info(f"✓ Cache copied to {context_cache_dir}")
+        except (OSError, IOError) as e:
+            logger.error(f"Failed to copy cache to build context: {e}")
+            raise IIBError(f"Failed to copy cache to build context: {e}")
+
         # Build images for each platform
         platform_images = []
         for platform in self.config.platforms:
@@ -450,21 +488,18 @@ class MultiArchBuilder:
                 platform_image = f"{self.config.image_name}-{platform_clean}"
                 self._build_image(platform_clean, platform_image)
                 platform_images.append(platform_image)
-            except Exception as e:
+            except (IIBError, ExternalServiceError) as e:
                 logger.error(f"Failed to build for {platform}: {e}")
                 raise
         
         # Create and push manifest
         logger.info("Creating and pushing multi-arch manifest")
         
-        # Convert platforms to arch set
-        arches = set(self.config.platforms)
-        
         # Create and push manifest list
-        self._create_and_push_manifest_list(arches, platform_images)
+        self._create_and_push_manifest_list(platform_images)
         
         # Get manifest digest
-        inspect_cmd = ['skopeo', 'inspect', '--no-tags', self.config.image_name]
+        inspect_cmd = ['skopeo', 'inspect', '--no-tags', f'docker://{self.config.image_name}']
         result = run_cmd(inspect_cmd, {'timeout': 60}, "inspect manifest failed")
         manifest_data = json.loads(result)
         digest = manifest_data.get('Digest', '')
@@ -479,7 +514,12 @@ class MultiArchBuilder:
 
 
 def load_config_from_env() -> BuildConfig:
-    """Load configuration from environment variables."""
+    """
+    Load configuration from environment variables.
+
+    :return: BuildConfig object populated from environment variables
+    :rtype: BuildConfig
+    """
     # Source code is extracted to /var/workdir/source by the use-trusted-artifact step
     source_dir = "/var/workdir/source"
     
@@ -498,17 +538,20 @@ def load_config_from_env() -> BuildConfig:
         dockerfile_path=dockerfile_path,
         context_path=context_path,
         platforms=os.environ.get('PLATFORMS', 'amd64,arm64,ppc64le,s390x').split(','),
-        labels=os.environ.get('LABELS', '').split(',') if os.environ.get('LABELS') else [],
+        labels=os.environ.get('LABELS', '').split(','),
         cache_dir=os.environ.get('CACHE_DIR', '/var/workdir/cache'),
         commit_sha=os.environ.get('COMMIT_SHA', ''),
         opm_version=os.environ.get('OPM_VERSION', 'v1.40.0'),
-        retry_attempts=int(os.environ.get('RETRY_ATTEMPTS', '3')),
-        retry_delay=int(os.environ.get('RETRY_DELAY', '5'))
     )
 
 
 def main():
-    """Main entry point."""
+    """
+    Main entry point for the multi-architecture container builder.
+
+    Parses command line arguments, loads configuration from environment,
+    and executes the build process.
+    """
     parser = argparse.ArgumentParser(description='Multi-architecture container builder')
     parser.add_argument('--ca-bundle', help='Path to CA bundle file')
     parser.add_argument('--output', help='Path to output results JSON file')
@@ -537,7 +580,7 @@ def main():
         
         logger.info("Multi-architecture build completed successfully")
         
-    except Exception as e:
+    except (IIBError, ExternalServiceError, RuntimeError, ValueError) as e:
         logger.error(f"Build failed: {e}")
         sys.exit(1)
 
