@@ -7,6 +7,7 @@ on:
       - main
     paths:
       - 'Containerfile.iib-build-task'
+      - 'task/iib-image-builder-oci-ta/multi-arch-builder.py'
 jobs:
   build-and-push:
     name: Build and Push Docker Image (Buildah)
