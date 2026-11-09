@@ -9,6 +9,7 @@ filename contains a hyphen) and registered in sys.modules as
 import json
 import os
 import subprocess
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import multi_arch_builder as mab
@@ -25,6 +26,12 @@ def _make_completed_process(returncode=0, stdout="", stderr=""):
     proc.stdout = stdout
     proc.stderr = stderr
     return proc
+
+
+def _run_cmd_with_push_digest(cmd, *args, **kwargs):
+    if "--digestfile" in cmd:
+        Path(cmd[cmd.index("--digestfile") + 1]).write_text("sha256:" + "a" * 64)
+    return '{"Digest": "sha256:abc"}'
 
 
 # ---------------------------------------------------------------------------
@@ -503,16 +510,36 @@ class TestBuildImage:
 
 class TestPushImage:
     @patch("multi_arch_builder.run_cmd")
-    def test_executes_buildah_push_with_correct_flags(self, mock_run_cmd, builder):
-        builder._push_image.__wrapped__(builder, "quay.io/org/img:latest-amd64")
+    def test_returns_remote_digest_from_push(self, mock_run_cmd, builder):
+        digest = "sha256:" + "a" * 64
+
+        def push_with_digest(cmd, *args, **kwargs):
+            Path(cmd[cmd.index("--digestfile") + 1]).write_text(digest + "\n")
+
+        mock_run_cmd.side_effect = push_with_digest
+        result = builder._push_image.__wrapped__(builder, "quay.io/org/img:latest-amd64")
+        assert result == digest
         cmd = mock_run_cmd.call_args[0][0]
-        assert cmd == [
-            "buildah",
-            "push",
-            "--tls-verify=true",
+        assert cmd[:3] == ["buildah", "push", "--tls-verify=true"]
+        assert cmd[-2:] == [
             "quay.io/org/img:latest-amd64",
             "docker://quay.io/org/img:latest-amd64",
         ]
+        assert "--digestfile" in cmd
+
+    @patch("multi_arch_builder.run_cmd")
+    def test_rejects_missing_push_digest(self, mock_run_cmd, builder):
+        with pytest.raises(mab.IIBError, match="digest"):
+            builder._push_image.__wrapped__(builder, "quay.io/org/img:latest-amd64")
+
+    @patch("multi_arch_builder.run_cmd")
+    def test_rejects_malformed_push_digest(self, mock_run_cmd, builder):
+        def push_with_bad_digest(cmd, *args, **kwargs):
+            Path(cmd[cmd.index("--digestfile") + 1]).write_text("sha256:bad\n")
+
+        mock_run_cmd.side_effect = push_with_bad_digest
+        with pytest.raises(mab.IIBError, match="digest"):
+            builder._push_image.__wrapped__(builder, "quay.io/org/img:latest-amd64")
 
     @patch("multi_arch_builder.run_cmd", side_effect=mab.ExternalServiceError("503"))
     def test_raises_external_service_error_on_network_failure(self, mock_run_cmd, builder):
@@ -529,43 +556,87 @@ class TestVerifyManifestList:
     @patch("multi_arch_builder.run_cmd")
     def test_passes_when_all_arches_present(self, mock_run_cmd, builder):
         builder.config.platforms = ["amd64", "arm64"]
+        digests = {"img-amd64": "sha256:" + "a" * 64, "img-arm64": "sha256:" + "b" * 64}
         mock_run_cmd.return_value = json.dumps(
             {
                 "manifests": [
-                    {"platform": {"architecture": "amd64"}},
-                    {"platform": {"architecture": "arm64"}},
+                    {
+                        "platform": {"os": "linux", "architecture": "amd64"},
+                        "digest": digests["img-amd64"],
+                    },
+                    {
+                        "platform": {"os": "linux", "architecture": "arm64"},
+                        "digest": digests["img-arm64"],
+                    },
                 ]
             }
         )
-        builder._verify_manifest_list("quay.io/org/img:v1", ["img-amd64", "img-arm64"])
+        builder._verify_manifest_list("quay.io/org/img:v1", ["img-amd64", "img-arm64"], digests)
 
     @patch("multi_arch_builder.run_cmd")
     def test_raises_when_arch_missing(self, mock_run_cmd, builder):
         builder.config.platforms = ["amd64", "arm64", "s390x"]
+        digests = {
+            "img-amd64": "sha256:" + "a" * 64,
+            "img-arm64": "sha256:" + "b" * 64,
+            "img-s390x": "sha256:" + "c" * 64,
+        }
         mock_run_cmd.return_value = json.dumps(
             {
                 "manifests": [
-                    {"platform": {"architecture": "amd64"}},
-                    {"platform": {"architecture": "arm64"}},
+                    {
+                        "platform": {"os": "linux", "architecture": "amd64"},
+                        "digest": digests["img-amd64"],
+                    },
+                    {
+                        "platform": {"os": "linux", "architecture": "arm64"},
+                        "digest": digests["img-arm64"],
+                    },
                 ]
             }
         )
         with pytest.raises(mab.IIBError, match="expected.*s390x"):
-            builder._verify_manifest_list("quay.io/org/img:v1", ["img-amd64", "img-arm64"])
+            builder._verify_manifest_list(
+                "quay.io/org/img:v1", ["img-amd64", "img-arm64", "img-s390x"], digests
+            )
 
     @patch("multi_arch_builder.run_cmd")
     def test_raises_when_extra_arch_present(self, mock_run_cmd, builder):
         builder.config.platforms = ["amd64"]
+        digests = {"img-amd64": "sha256:" + "a" * 64}
         mock_run_cmd.return_value = json.dumps(
             {
                 "manifests": [
-                    {"platform": {"architecture": "amd64"}},
-                    {"platform": {"architecture": "arm64"}},
+                    {
+                        "platform": {"os": "linux", "architecture": "amd64"},
+                        "digest": digests["img-amd64"],
+                    },
+                    {
+                        "platform": {"os": "linux", "architecture": "arm64"},
+                        "digest": "sha256:" + "b" * 64,
+                    },
                 ]
             }
         )
         with pytest.raises(mab.IIBError, match="expected"):
-            builder._verify_manifest_list("quay.io/org/img:v1", ["img-amd64"])
+            builder._verify_manifest_list("quay.io/org/img:v1", ["img-amd64"], digests)
+
+    @patch("multi_arch_builder.run_cmd")
+    def test_rejects_wrong_child_digest_with_correct_architecture(self, mock_run_cmd, builder):
+        builder.config.platforms = ["amd64"]
+        expected = {"img-amd64": "sha256:" + "a" * 64}
+        mock_run_cmd.return_value = json.dumps(
+            {
+                "manifests": [
+                    {
+                        "platform": {"os": "linux", "architecture": "amd64"},
+                        "digest": "sha256:" + "b" * 64,
+                    }
+                ]
+            }
+        )
+        with pytest.raises(mab.IIBError, match="expected"):
+            builder._verify_manifest_list("quay.io/org/img:v1", ["img-amd64"], expected)
 
     @patch("multi_arch_builder.MultiArchBuilder._create_and_push_manifest_list")
     @patch("multi_arch_builder.MultiArchBuilder._build_image")
@@ -687,7 +758,7 @@ class TestBuildAllNormalizesConfigsPermissions:
             (cache_dir / "digest").write_text("abc")
 
         mock_gen_cache.side_effect = capture_modes
-        mock_run_cmd.return_value = '{"Digest": "sha256:abc"}'
+        mock_run_cmd.side_effect = _run_cmd_with_push_digest
 
         umask_before = os.umask(0o022)
         os.umask(umask_before)
@@ -720,6 +791,44 @@ class TestBuildAllNormalizesConfigsPermissions:
 class TestBuildAllSkipsOpmCacheForRegenerateBundle:
     @patch("multi_arch_builder.MultiArchBuilder._create_and_push_manifest_list")
     @patch("multi_arch_builder.MultiArchBuilder._build_image")
+    @patch("multi_arch_builder.MultiArchBuilder._prepare_system")
+    @patch("multi_arch_builder.run_cmd")
+    def test_uses_verified_push_digest_for_result(
+        self, mock_run_cmd, mock_prepare, mock_build, mock_manifest, builder, tmp_path
+    ):
+        dockerfile = tmp_path / "Dockerfile"
+        dockerfile.write_text("FROM scratch\n")
+        builder.config.dockerfile_path = str(dockerfile)
+        builder.config.skip_opm_cache = True
+        builder.config.platforms = ["amd64"]
+        mock_manifest.return_value = "sha256:" + "c" * 64
+        mock_run_cmd.side_effect = _run_cmd_with_push_digest
+
+        result = builder.build_all()
+
+        assert result["digest"] == "sha256:" + "c" * 64
+        assert not any(
+            call.args[0][:2] == ["skopeo", "inspect"] for call in mock_run_cmd.call_args_list
+        )
+
+    @patch("multi_arch_builder.MultiArchBuilder._build_image")
+    @patch("multi_arch_builder.MultiArchBuilder._prepare_system")
+    def test_rejects_duplicate_platforms_before_building(
+        self, mock_prepare, mock_build, builder, tmp_path
+    ):
+        dockerfile = tmp_path / "Dockerfile"
+        dockerfile.write_text("FROM scratch\n")
+        builder.config.dockerfile_path = str(dockerfile)
+        builder.config.skip_opm_cache = True
+        builder.config.platforms = ["amd64", " amd64 "]
+
+        with pytest.raises(mab.IIBError, match="Duplicate.*amd64"):
+            builder.build_all()
+
+        mock_build.assert_not_called()
+
+    @patch("multi_arch_builder.MultiArchBuilder._create_and_push_manifest_list")
+    @patch("multi_arch_builder.MultiArchBuilder._build_image")
     @patch("multi_arch_builder.generate_cache_locally")
     @patch("multi_arch_builder.MultiArchBuilder._prepare_system")
     @patch("multi_arch_builder.run_cmd")
@@ -749,11 +858,15 @@ class TestBuildAllSkipsOpmCacheForRegenerateBundle:
             skip_opm_cache=True,
         )
         builder = mab.MultiArchBuilder(cfg)
-        mock_run_cmd.return_value = '{"Digest": "sha256:abc"}'
+        mock_run_cmd.side_effect = _run_cmd_with_push_digest
 
         builder.build_all()
 
         mock_gen_cache.assert_not_called()
+        mock_manifest.assert_called_once_with(
+            ["quay.io/org/img:latest-amd64"],
+            {"quay.io/org/img:latest-amd64": "sha256:" + "a" * 64},
+        )
 
     @patch("multi_arch_builder.MultiArchBuilder._create_and_push_manifest_list")
     @patch("multi_arch_builder.MultiArchBuilder._build_image")
@@ -786,7 +899,7 @@ class TestBuildAllSkipsOpmCacheForRegenerateBundle:
             skip_opm_cache=True,
         )
         builder = mab.MultiArchBuilder(cfg)
-        mock_run_cmd.return_value = '{"Digest": "sha256:abc"}'
+        mock_run_cmd.side_effect = _run_cmd_with_push_digest
 
         builder.build_all()
 
@@ -833,7 +946,7 @@ class TestBuildAllSkipsOpmCacheForRegenerateBundle:
             (cache_dir / "packages.json").write_text("{}")
 
         mock_gen_cache.side_effect = populate_cache
-        mock_run_cmd.return_value = '{"Digest": "sha256:abc"}'
+        mock_run_cmd.side_effect = _run_cmd_with_push_digest
 
         builder.build_all()
 
@@ -848,43 +961,197 @@ class TestBuildAllSkipsOpmCacheForRegenerateBundle:
 class TestCreateAndPushManifestList:
     @staticmethod
     def _manifest_inspect_json(arches):
-        return json.dumps({"manifests": [{"platform": {"architecture": a}} for a in arches]})
+        digests = {"amd64": "sha256:" + "a" * 64, "arm64": "sha256:" + "b" * 64}
+        return json.dumps(
+            {
+                "manifests": [
+                    {"platform": {"os": "linux", "architecture": arch}, "digest": digests[arch]}
+                    for arch in arches
+                ]
+            }
+        )
 
     @patch("multi_arch_builder.run_cmd")
-    def test_creates_manifest_and_copies_to_second_tag(self, mock_run_cmd, builder):
-        """With a commit_sha, primary tag is built+pushed, second is skopeo-copied."""
+    def test_rejects_remote_manifest_with_wrong_child_digest(self, mock_run_cmd, builder):
+        builder.config.image_name = "quay.io/org/img:latest"
+        builder.config.commit_sha = ""
+        builder.config.platforms = ["amd64"]
+        image = "quay.io/org/img:latest-amd64"
+
+        def side_effect(cmd, *args, **kwargs):
+            if cmd[:3] == ["buildah", "manifest", "rm"]:
+                raise mab.IIBError("Manifest list not found locally.")
+            if cmd[:3] == ["buildah", "manifest", "inspect"]:
+                return self._manifest_inspect_json(["amd64"])
+            if cmd[:3] == ["buildah", "manifest", "push"]:
+                Path(cmd[cmd.index("--digestfile") + 1]).write_text("sha256:" + "c" * 64)
+            if cmd[:2] == ["skopeo", "inspect"] and "--raw" in cmd:
+                return json.dumps(
+                    {
+                        "schemaVersion": 2,
+                        "mediaType": "application/vnd.docker.distribution.manifest.list.v2+json",
+                        "manifests": [
+                            {
+                                "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+                                "digest": "sha256:" + "b" * 64,
+                                "size": 123,
+                                "platform": {"architecture": "amd64", "os": "linux"},
+                            }
+                        ],
+                    }
+                )
+            if cmd[:2] == ["skopeo", "inspect"]:
+                return json.dumps({"Digest": "sha256:" + "c" * 64})
+            return ""
+
+        mock_run_cmd.side_effect = side_effect
+
+        with pytest.raises(mab.IIBError, match="Manifest list.*expected"):
+            builder._create_and_push_manifest_list.__wrapped__(
+                builder, [image], {image: "sha256:" + "a" * 64}
+            )
+
+    @patch("multi_arch_builder.run_cmd")
+    def test_keeps_registry_port_in_manifest_reference(self, mock_run_cmd, builder):
+        builder.config.image_name = "registry.example:5000/org/img:v1"
+        builder.config.commit_sha = "abc123"
+        builder.config.platforms = ["amd64"]
+        image = "registry.example:5000/org/img:v1-amd64"
+
+        def side_effect(cmd, *args, **kwargs):
+            if cmd[:3] == ["buildah", "manifest", "rm"]:
+                raise mab.IIBError("Manifest list not found locally.")
+            if cmd[:3] == ["buildah", "manifest", "inspect"]:
+                return self._manifest_inspect_json(["amd64"])
+            if cmd[:3] == ["buildah", "manifest", "push"]:
+                Path(cmd[cmd.index("--digestfile") + 1]).write_text("sha256:" + "c" * 64)
+            if cmd[:2] == ["skopeo", "inspect"] and "--raw" in cmd:
+                return self._manifest_inspect_json(["amd64"])
+            if cmd[:2] == ["skopeo", "inspect"]:
+                return json.dumps({"Digest": "sha256:" + "c" * 64})
+            return ""
+
+        mock_run_cmd.side_effect = side_effect
+        builder._create_and_push_manifest_list.__wrapped__(
+            builder, [image], {image: "sha256:" + "a" * 64}
+        )
+        commands = [call.args[0] for call in mock_run_cmd.call_args_list]
+        assert ["buildah", "manifest", "create", "registry.example:5000/org/img:v1"] in commands
+        assert [
+            "skopeo",
+            "copy",
+            "--all",
+            "--preserve-digests",
+            "docker://registry.example:5000/org/img@sha256:" + "c" * 64,
+            "docker://registry.example:5000/org/img:abc123",
+        ] in commands
+
+    @patch("multi_arch_builder.run_cmd")
+    def test_adds_pushed_digests_and_pushes_all_for_safety(self, mock_run_cmd, builder):
         builder.config.image_name = "quay.io/org/img:latest"
         builder.config.commit_sha = "abc123"
         platform_images = [
             "quay.io/org/img:latest-amd64",
             "quay.io/org/img:latest-arm64",
         ]
+        pushed_digests = {
+            platform_images[0]: "sha256:" + "a" * 64,
+            platform_images[1]: "sha256:" + "b" * 64,
+        }
 
         def side_effect(cmd, *args, **kwargs):
             if "rm" in cmd:
                 raise mab.IIBError("Manifest list not found locally.")
-            if "inspect" in cmd:
+            if cmd[:3] == ["buildah", "manifest", "inspect"]:
                 return self._manifest_inspect_json(["amd64", "arm64"])
+            if cmd[:3] == ["buildah", "manifest", "push"]:
+                Path(cmd[cmd.index("--digestfile") + 1]).write_text("sha256:" + "c" * 64)
+            if cmd[:2] == ["skopeo", "inspect"] and "--raw" in cmd:
+                return self._manifest_inspect_json(["amd64", "arm64"])
+            if cmd[:2] == ["skopeo", "inspect"]:
+                return json.dumps({"Digest": "sha256:" + "c" * 64})
             return ""
 
         mock_run_cmd.side_effect = side_effect
-        builder._create_and_push_manifest_list.__wrapped__(builder, platform_images)
+        manifest_digest = builder._create_and_push_manifest_list.__wrapped__(
+            builder, platform_images, pushed_digests
+        )
+        assert manifest_digest == "sha256:" + "c" * 64
 
-        # Primary tag: rm + create + 2×add + inspect + push = 6
-        # Second tag: 1 skopeo copy = 7 total
-        assert mock_run_cmd.call_count == 7
-        # Last call should be skopeo copy
-        last_cmd = mock_run_cmd.call_args_list[-1][0][0]
-        assert last_cmd[0] == "skopeo"
-        assert "copy" in last_cmd
-        assert "--all" in last_cmd
-        assert "docker://quay.io/org/img:latest" in last_cmd
-        assert "docker://quay.io/org/img:abc123" in last_cmd
+        commands = [call.args[0] for call in mock_run_cmd.call_args_list]
+        add_commands = [cmd for cmd in commands if cmd[:3] == ["buildah", "manifest", "add"]]
+        assert add_commands == [
+            [
+                "buildah",
+                "manifest",
+                "add",
+                "quay.io/org/img:latest",
+                "docker://quay.io/org/img@sha256:" + "a" * 64,
+            ],
+            [
+                "buildah",
+                "manifest",
+                "add",
+                "quay.io/org/img:latest",
+                "docker://quay.io/org/img@sha256:" + "b" * 64,
+            ],
+        ]
+        push = next(cmd for cmd in commands if cmd[:3] == ["buildah", "manifest", "push"])
+        assert "--all" in push
+        assert "--all=false" not in push
+        assert "--digestfile" in push
+        assert [cmd for cmd in commands if cmd[:2] == ["skopeo", "copy"]] == [
+            [
+                "skopeo",
+                "copy",
+                "--all",
+                "--preserve-digests",
+                "docker://quay.io/org/img@sha256:" + "c" * 64,
+                "docker://quay.io/org/img:abc123",
+            ]
+        ]
+        assert not any(cmd[:2] == ["oras", "tag"] for cmd in commands)
+        assert [
+            "skopeo",
+            "inspect",
+            "--raw",
+            "docker://quay.io/org/img@sha256:" + "c" * 64,
+        ] in commands
+        assert sum(cmd[:2] == ["skopeo", "inspect"] for cmd in commands) == 3
+
+    @patch("multi_arch_builder.run_cmd")
+    def test_rejects_second_tag_with_different_digest(self, mock_run_cmd, builder):
+        builder.config.image_name = "quay.io/org/img:latest"
+        builder.config.commit_sha = "abc123"
+        image = "quay.io/org/img:latest-amd64"
+        builder.config.platforms = ["amd64"]
+        pushed_digests = {image: "sha256:" + "a" * 64}
+
+        def side_effect(cmd, *args, **kwargs):
+            if "rm" in cmd:
+                raise mab.IIBError("Manifest list not found locally.")
+            if cmd[:3] == ["buildah", "manifest", "inspect"]:
+                return self._manifest_inspect_json(["amd64"])
+            if cmd[:3] == ["buildah", "manifest", "push"]:
+                Path(cmd[cmd.index("--digestfile") + 1]).write_text("sha256:" + "c" * 64)
+            if cmd[:2] == ["skopeo", "inspect"] and "--raw" in cmd:
+                return self._manifest_inspect_json(["amd64"])
+            if cmd[:2] == ["skopeo", "inspect"]:
+                digest = "sha256:" + ("d" if cmd[-1].endswith(":abc123") else "c") * 64
+                return json.dumps({"Digest": digest})
+            return ""
+
+        mock_run_cmd.side_effect = side_effect
+        with pytest.raises(mab.IIBError, match="digest"):
+            builder._create_and_push_manifest_list.__wrapped__(builder, [image], pushed_digests)
 
     @patch("multi_arch_builder.run_cmd")
     def test_removes_existing_manifest_before_creating(self, mock_run_cmd, builder):
         builder.config.image_name = "quay.io/org/img:latest"
         builder.config.commit_sha = ""
+        builder.config.platforms = ["amd64"]
+        image = "quay.io/org/img:latest-amd64"
+        pushed_digests = {image: "sha256:" + "a" * 64}
 
         rm_attempted = []
 
@@ -892,14 +1159,18 @@ class TestCreateAndPushManifestList:
             if "rm" in cmd:
                 rm_attempted.append(True)
                 raise mab.IIBError("Manifest list not found locally.")
-            if "inspect" in cmd:
-                return self._manifest_inspect_json(["amd64", "arm64"])
+            if cmd[:3] == ["buildah", "manifest", "inspect"]:
+                return self._manifest_inspect_json(["amd64"])
+            if cmd[:3] == ["buildah", "manifest", "push"]:
+                Path(cmd[cmd.index("--digestfile") + 1]).write_text("sha256:" + "c" * 64)
+            if cmd[:2] == ["skopeo", "inspect"] and "--raw" in cmd:
+                return self._manifest_inspect_json(["amd64"])
+            if cmd[:2] == ["skopeo", "inspect"]:
+                return json.dumps({"Digest": "sha256:" + "c" * 64})
             return ""
 
         mock_run_cmd.side_effect = side_effect
-        builder._create_and_push_manifest_list.__wrapped__(
-            builder, ["quay.io/org/img:latest-amd64"]
-        )
+        builder._create_and_push_manifest_list.__wrapped__(builder, [image], pushed_digests)
         assert rm_attempted
 
     @patch("multi_arch_builder.run_cmd")
@@ -915,13 +1186,16 @@ class TestCreateAndPushManifestList:
         mock_run_cmd.side_effect = side_effect
         with pytest.raises(mab.IIBError, match="Error removing local manifest list"):
             builder._create_and_push_manifest_list.__wrapped__(
-                builder, ["quay.io/org/img:latest-amd64"]
+                builder,
+                ["quay.io/org/img:latest-amd64"],
+                {"quay.io/org/img:latest-amd64": "sha256:" + "a" * 64},
             )
 
     @patch("multi_arch_builder.run_cmd")
-    def test_push_uses_docker_scheme_and_all_flag(self, mock_run_cmd, builder):
+    def test_push_uses_docker_scheme_and_includes_children(self, mock_run_cmd, builder):
         builder.config.image_name = "quay.io/org/img:v1"
         builder.config.commit_sha = ""
+        builder.config.platforms = ["amd64"]
 
         push_cmds = []
 
@@ -930,12 +1204,22 @@ class TestCreateAndPushManifestList:
                 push_cmds.append(cmd)
             if "rm" in cmd:
                 raise mab.IIBError("Manifest list not found locally.")
-            if "inspect" in cmd:
-                return self._manifest_inspect_json(["amd64", "arm64"])
+            if cmd[:3] == ["buildah", "manifest", "inspect"]:
+                return self._manifest_inspect_json(["amd64"])
+            if cmd[:3] == ["buildah", "manifest", "push"]:
+                Path(cmd[cmd.index("--digestfile") + 1]).write_text("sha256:" + "c" * 64)
+            if cmd[:2] == ["skopeo", "inspect"] and "--raw" in cmd:
+                return self._manifest_inspect_json(["amd64"])
+            if cmd[:2] == ["skopeo", "inspect"]:
+                return json.dumps({"Digest": "sha256:" + "c" * 64})
             return ""
 
         mock_run_cmd.side_effect = side_effect
-        builder._create_and_push_manifest_list.__wrapped__(builder, ["quay.io/org/img:v1-amd64"])
+        builder._create_and_push_manifest_list.__wrapped__(
+            builder,
+            ["quay.io/org/img:v1-amd64"],
+            {"quay.io/org/img:v1-amd64": "sha256:" + "a" * 64},
+        )
 
         assert push_cmds, "push was never called"
         push_cmd = push_cmds[0]
@@ -1052,6 +1336,10 @@ class TestArchesFromMetadata:
     def test_raises_when_arches_empty(self):
         with pytest.raises(mab.IIBError, match="at least one architecture"):
             mab.arches_from_metadata({"arches": []})
+
+    def test_rejects_duplicate_arches_after_trimming(self):
+        with pytest.raises(mab.IIBError, match="duplicate architectures"):
+            mab.arches_from_metadata({"arches": ["amd64", " amd64 "]})
 
 
 class TestBinaryImageFromMetadata:
